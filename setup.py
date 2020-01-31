@@ -2,6 +2,8 @@ from setuptools import setup, find_packages
 
 requires = [
     'xlsxwriter',
+    'sqlalchemy',
+    'zope.sqlalchemy',
 ]
 
 setup(
@@ -17,5 +19,6 @@ setup(
     entry_points="""\
         [console_scripts]
         sparkperfreport_report = sparkperfreport.report:main
+        sparkperfreport_initialize_db = sparkperfreport.initialize_db:main
     """,
 )

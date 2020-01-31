@@ -2,27 +2,38 @@ import os
 import sys
 import argparse
 
+import statistics
+import transaction
+
 import json
 
 from collections import defaultdict
-import xlsxwriter
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import joinedload
+
+from . import DBSession
 from .constants import (
-    MLLIB_TESTS,
     IGNORE_TESTS,
 )
 
-import statistics
+from .models import (
+    SparkPerfTestingResults,
+    SparkPerfTestResultTypeEnum,
+    SparkPerfClusterTest,
+    SparkPerfTestPack,
+)
 
-from .model import SparkPerfTestingResults
+from .writer import ResultFileWriter
 
 
 class MetricsData:
-    def __init__(self, input_path):
+    def __init__(self, cluster_label):
         self.data = defaultdict(dict)
-        self.input_path = input_path
+        self.cluster_label = cluster_label
 
-    def get_data_from_folder(self):
+    def get_data_from_folder(self, input_path):
+        self.input_path = input_path
         file_list = os.listdir(self.input_path)
         for folder in file_list:
             path = os.path.join(self.input_path, folder)
@@ -35,7 +46,9 @@ class MetricsData:
                 if name in IGNORE_TESTS:
                     continue
                 if ext == '.out':
-                    self.get_data_from_file(test_name, name, os.path.join(path, file))
+                    self.get_data_from_file(
+                        test_name, name, os.path.join(path, file)
+                    )
 
     def get_data_from_file(self, test_name, name, file_path):
         with open(file_path, 'r') as f:
@@ -51,11 +64,13 @@ class MetricsData:
                 try:
                     res = SparkPerfTestingResults(d['results'])
                     dct = {}
-                    for i in ['training_time', 'test_time']:
+                    for i in SparkPerfTestResultTypeEnum.names():
                         stat = {}
                         for func in ['stdev', 'mean', 'median']:
                             try:
-                                stat[func] = getattr(statistics, func)(getattr(res, i))
+                                stat[func] = getattr(statistics, func)(
+                                    getattr(res, i)
+                                )
                             except (TypeError, ValueError):
                                 stat[func] = None
                         dct[i] = stat
@@ -66,79 +81,42 @@ class MetricsData:
                         counts[d['testName']] += 1
                         if counts[d['testName']] > 1:
                             if self.data[test_name].get(d['testName']):
-                                self.data[test_name][d['testName'] + '-1'] = self.data['mllib'][d['testName']]
+                                self.data[test_name][d['testName'] + '-1'] = \
+                                    self.data['mllib'][d['testName']]
                                 del self.data['mllib'][d['testName']]
-                            self.data[test_name]['{}-{}'.format(d['testName'], counts[d['testName']])] = dct
+                            self.data[test_name]['{}-{}'.format(
+                                d['testName'], counts[d['testName']]
+                            )] = dct
                         else:
                             self.data[test_name][d['testName']] = dct
                 except KeyError:
                     pass
 
+    def write_results_to_db(self):
+        cluster = SparkPerfClusterTest(cluster_label=self.cluster_label)
+        DBSession.add(cluster)
+        DBSession.flush()
 
-def write_results(data, output_path):
-    workbook = xlsxwriter.Workbook(output_path)
+        cluster.process_data(self.data)
 
-    for testpack in ['decision-tree', 'mllib']:
-        worksheet = workbook.add_worksheet(testpack)
-        worksheet.merge_range('C1:E1', 'Тестування')
-        worksheet.merge_range('F1:H1', 'Навчання')
-        worksheet.merge_range('A1:A2', '№' if testpack == 'decision-tree' else 'Назва тесту')
-        worksheet.merge_range('B1:B2', 'Id')
-        worksheet.merge_range('I1:I2', 'Серед. зн. тест. / серед. зн. навч.')
-        worksheet.write('C2', 'Серед.зн., с')
-        worksheet.write('D2', 'Медіана, с')
-        worksheet.write('E2', 'СКВ')
-        worksheet.write('F2', 'Серед.зн., с')
-        worksheet.write('G2', 'Медіана, с')
-        worksheet.write('H2', 'СКВ')
-        keys = data[testpack].keys() if testpack == 'decision-tree' else MLLIB_TESTS
-        prefix = 'DTR' if testpack == 'decision-tree' else 'ML'
-        for index, i in enumerate(keys):
-            worksheet.write('A{}'.format(index + 3), i)
-            worksheet.write('B{}'.format(index + 3), '{}{}'.format(prefix, index + 1))
-            try:
-                worksheet.write('C{}'.format(index + 3), round(data[testpack][i]['test_time']['mean'], 4))
-                worksheet.write('D{}'.format(index + 3), round(data[testpack][i]['test_time']['median'], 4))
-                worksheet.write('E{}'.format(index + 3), round(data[testpack][i]['test_time']['stdev'], 4))
-                if data[testpack][i]['training_time']['mean']:
-                    worksheet.write('F{}'.format(index + 3), round(data[testpack][i]['training_time']['mean'], 4))
-                else:
-                    worksheet.write('F{}'.format(index + 3), '-')
-                if data[testpack][i]['training_time']['median']:
-                    worksheet.write('G{}'.format(index + 3), round(data[testpack][i]['training_time']['median'], 4))
-                else:
-                    worksheet.write('G{}'.format(index + 3), '-')
-                if data[testpack][i]['training_time']['stdev']:
-                    worksheet.write('H{}'.format(index + 3), round(data[testpack][i]['training_time']['stdev'], 4))
-                else:
-                    worksheet.write('H{}'.format(index + 3), '-')
-                if data[testpack][i]['training_time']['mean']:
-                    worksheet.write('I{}'.format(index + 3), round(
-                        data[testpack][i]['test_time']['mean'] /
-                        data[testpack][i]['training_time']['mean'], 4))
-            except KeyError as e:
-                print(e)
-                pass
-    worksheet = workbook.add_worksheet('core')
-    worksheet.write('A1', 'Назва тесту')
-    worksheet.write('B1', 'Ідентифікатор')
-    worksheet.write('C1', 'Серед.зн., с')
-    worksheet.write('D1', 'Медіана, с')
-    worksheet.write('E1', 'СКВ')
-    keys = data['spark'].keys()
-    prefix = 'C'
-    for index, i in enumerate(keys):
-        worksheet.write('A{}'.format(index + 2), i)
-        print(data['spark'])
-        worksheet.write('B{}'.format(index + 2), '{}{}'.format(prefix, index + 1))
-        try:
-            worksheet.write('C{}'.format(index + 2), round(data['spark'][i]['test_time']['mean'], 4))
-            worksheet.write('D{}'.format(index + 2), round(data['spark'][i]['test_time']['median'], 4))
-            worksheet.write('E{}'.format(index + 2), round(data['spark'][i]['test_time']['stdev'], 4))
-        except KeyError as e:
-            print(e)
-            pass
-    workbook.close()
+    def get_data_from_db(self):
+        cluster = DBSession.query(SparkPerfClusterTest) \
+            .filter(SparkPerfClusterTest.cluster_label == self.cluster_label) \
+            .options(
+                joinedload(SparkPerfClusterTest.test_packs_data)
+                .joinedload(SparkPerfTestPack.results)
+            ) \
+            .first()
+        if cluster:
+            print(cluster.to_dict())
+
+    def write_results_to_file(self, output_path):
+        writer = ResultFileWriter(output_path, self.data)
+        writer.write_results()
+
+
+def write_results_to_file_from_data(data, output_path, cluster):
+    pass
 
 
 def main(argv=sys.argv):
@@ -146,22 +124,68 @@ def main(argv=sys.argv):
         Get report for SparkPerf metrics in XLS format.
     """
     parser = argparse.ArgumentParser(description=description)
-    parser.add_argument('input_path', metavar='input_path',
-        help='Path to results folder')
+    parser.add_argument(
+        'cluster_label',
+        metavar='cluster_label',
+        help='Cluster label (for DB)'
+    )
 
-    parser.add_argument('-o', '--output', dest='output_path',
+    parser.add_argument(
+        'database_url',
+        metavar='database_url',
+        help='Database URL'
+    )
+
+    parser.add_argument(
+        '-i', '--input-path',
+        dest='input_path',
+        help='Path to results folder'
+    )
+
+    parser.add_argument(
+        '-o', '--output', dest='output_path',
         default='results.xlsx',
-        help='Output file path')
+        help='Output file path'
+    )
+
+    parser.add_argument(
+        '-w', '--write-file',
+        dest='write_file',
+        action='store_true',
+        help='Write result in file'
+    )
+
+    parser.add_argument(
+        '-r', '--read-directory',
+        dest='read_directory',
+        action='store_true',
+        help='Read results from directory'
+    )
 
     args = parser.parse_args(argv[1:])
 
-    data = MetricsData(args.input_path)
-    data.get_data_from_folder()
+    engine = create_engine(args.database_url)
 
-    if not data.data:
-        print('Input data folder is empty or no data found.')
-        return
-    write_results(data.data, args.output_path)
+    DBSession.configure(bind=engine)
+
+    data = MetricsData(args.cluster_label)
+
+    data.get_data_from_db()
+
+    if args.read_directory and not args.input_path:
+        raise RuntimeError('Please select input_path.')
+
+    elif args.read_directory:
+        data.get_data_from_folder(args.input_path)
+        if not data.data:
+            print('Input data folder is empty or no data found.')
+            return
+        with transaction.manager:
+            data.write_results_to_db()
+
+    if args.write_file:
+        # TODO: add read data from DB
+        data.write_results_to_file()
 
 
 if __name__ == '__main__':

@@ -25,3 +25,20 @@ MLLIB_TESTS = [
     'glm-classification-1',
     'glm-classification-2',
 ]
+
+WRITER_SETTINGS = {
+    'spark': {
+        'worksheet_name': 'core',
+        'prefix': 'C'
+    },
+    'decision-tree': {
+        'prefix': 'DTR'
+    },
+    'mllib': {
+        'prefix': 'ML',
+        'keys': MLLIB_TESTS,
+        'first_column_title': 'Назва тесту',
+    }
+}
+
+STATISTICS_PARAMS = ['stdev', 'mean', 'median']
